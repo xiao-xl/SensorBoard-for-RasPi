@@ -9,7 +9,7 @@ A sensorboard with python driver code designed for Raspberry Pi, include i2c sen
   * an example driver code for a single temperature and humidity sensor DHT22 in Python3, validated on Raspberry Pi 4B.
   * include writing data into sqlite3 database
 
-* `PCD Folder`
+* `/PCB Folder`
   * include circuit schematic and PCB layout files for Sensorboard
   * software version: AD and JLC EDA (for manufacturing)
   * manufacturing details in folder `/PCB/JLC/Manufacture`
