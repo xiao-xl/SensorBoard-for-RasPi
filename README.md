@@ -51,3 +51,7 @@ A sensorboard with python driver code designed for Raspberry Pi, include i2c sen
 * Add voltage regulator and surge protection chips to the power supply (Vcc), and consider whether the ground line (GND) goes through a switch.
 * Adjust the AGS10 chip's supply voltage to (3.0±0.1)V, and note that its I2C signal frequency is up to 15kHz. It is currently stable at 100kHz; if a higher frequency is needed, consider selecting a different chip.
 * To improve the stability of the MPU6500, consider adjusting the reflow soldering temperature or enhancing the stability of the jumper wires.
+
+## v 0.1.1
+* Add lowpass filter for MAX30102 to improve accuracy
+* support writing data to sqlite3 and query from database
