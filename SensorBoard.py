@@ -5,13 +5,15 @@ from datetime import datetime, timedelta
 import smbus
 import RPi.GPIO as GPIO
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, filtfilt
+import sqlite3
+import matplotlib.pyplot as plt
 
 DHT20_ADDRESS = 0x38
 AGS10_ADDRESS = 0x1A
 BH1750FVI_ADDRESS = 0x23 # ADDR_HIGH 0x5C
 BMP581_ADDRESS = 0x46 # SDO_HIGH 0x47
-MPU6500_ADDRESS = 0x68 # SDO_HIGH 0x67 ?
+MPU6500_ADDRESS = 0x68 # SDO_HIGH 0x69 ?
 MAX30102_ADDRESS = 0x57
 
 BH1750FVI_ADDR_PIN = 29
@@ -129,20 +131,21 @@ def MPU6500_init():
     GPIO.setup(MPU6500_SDO_PIN, GPIO.OUT, initial = GPIO.LOW)
     GPIO.setup(MPU6500_INT_PIN, GPIO.IN)
     GPIO.setup(MPU6500_FSYNC_PIN, GPIO.OUT, initial = GPIO.LOW) #if unuse, to GND
-    GPIO.setup(MPU6500_nCS_PIN, GPIO.IN)
+    GPIO.setup(MPU6500_nCS_PIN, GPIO.OUT, initial = GPIO.HIGH)
     time.sleep(0.1)
     GPIO.output(MPU6500_SDO_PIN, GPIO.LOW)
+    GPIO.setup(MPU6500_nCS_PIN, GPIO.HIGH)
     GPIO.output(MPU6500_FSYNC_PIN, GPIO.LOW)
     time.sleep(0.1)
     
     i2c.write_byte_data(MPU6500_ADDRESS, 0x6B, 0x80) #PWR_MGMT_1
-    time.sleep(0.1)
+    time.sleep(0.2)
     i2c.write_byte_data(MPU6500_ADDRESS, 0x6B, 0x00) #PWR_MGMT_1
-    
-    i2c.write_byte_data(MPU6500_ADDRESS, 0x6A, 0x08) #USER_CTRL DMP enable
-    time.sleep(0.1)
-    i2c.write_byte_data(MPU6500_ADDRESS, 0x6A, 0x00) #USER_CTRL DMP enable
-    
+    time.sleep(0.2)
+    i2c.write_byte_data(MPU6500_ADDRESS, 0x6A, 0x08) #USER_CTRL DMP reset
+    time.sleep(0.2)
+    i2c.write_byte_data(MPU6500_ADDRESS, 0x6A, 0x00) #USER_CTRL DMP reset
+    time.sleep(0.2)
     i2c.write_byte_data(MPU6500_ADDRESS, 0x1A, 0x00)
     i2c.write_byte_data(MPU6500_ADDRESS, 0x1B, 0x10) #1000 degrees pre second (Sensitivity Factor 32.8)
     i2c.write_byte_data(MPU6500_ADDRESS, 0x1C, 0x10) #8g (Sensitivity Factor 4096)
@@ -152,7 +155,7 @@ def MPU6500_init():
     i2c.write_byte_data(MPU6500_ADDRESS, 0x38, 0x40) #INT Wake on Motion
     i2c.write_byte_data(MPU6500_ADDRESS, 0x69, 0xC0) #ACCEL_INTEL_CTRL
     i2c.write_byte_data(MPU6500_ADDRESS, 0x6A, 0x80) #USER_CTRL DMP enable
-    i2c.write_byte_data(MPU6500_ADDRESS, 0x6B, 0x21) #PWR_MGMT_1
+    i2c.write_byte_data(MPU6500_ADDRESS, 0x6B, 0x01) #PWR_MGMT_1
     i2c.write_byte_data(MPU6500_ADDRESS, 0x6C, 0x00) #PWR_MGMT_2
 
 def MPU6500_sign(value):
@@ -229,20 +232,42 @@ def MAX30102_getdata():
     
     return red_data, ir_data, temp
 
-def MAX30102_manage_size(data_array, max_length = 500):
+def MAX30102_manage_size(data_array, max_length = 300):
     if len(data_array) > max_length:
         return data_array[-max_length:]
     else:
         return data_array
 
 def MAX30102_cal(red_data, ir_data, sampling_rate):
-    peaks, _ = find_peaks(ir_data, distance=sampling_rate/2)
+    #lowpass filter
+    #order = 4, cutoff = 3
+    b, a = butter(4, 3, btype = 'low', analog = False, fs = sampling_rate)
+    ir_data_filtered = filtfilt(b, a, ir_data)
+    
+    peaks, _ = find_peaks(ir_data_filtered, height = 2000, distance=sampling_rate/3)
+    valleys, _ = find_peaks(-ir_data_filtered, distance=sampling_rate/3)
+    
     if len(peaks) > 1:
-        peak_intervals = np.diff(peaks) / sampling_rate
-        heart_rate = 60.0 / np.mean(peak_intervals)
+        peak_avg = np.mean(ir_data_filtered[peaks])
+        valley_avg = np.mean(ir_data_filtered[valleys])
+        print(peak_avg - valley_avg)
+        if (peak_avg - valley_avg) > 500 and (peak_avg - valley_avg) < 2000:
+            peak_intervals = np.diff(peaks) / sampling_rate
+            heart_rate = 60.0 / np.mean(peak_intervals)
+        else:
+            heart_rate = -1.0
     else:
-        heart_rate = 0
-        
+        heart_rate = -1.0
+    
+    #plot
+#     plt.clf()
+#     plt.plot(ir_data_filtered)
+#     plt.plot(ir_data)
+#     plt.plot(peaks, ir_data_filtered[peaks], "*")
+#     plt.axhline(y =np.mean(ir_data_filtered), linestyle = '--', color='g')
+#     plt.draw()
+#     plt.pause(0.01)
+    
     red_ac = np.max(red_data) - np.min(red_data)
     ir_ac = np.max(ir_data) - np.min(ir_data)
     red_dc = np.mean(red_data)
@@ -252,7 +277,39 @@ def MAX30102_cal(red_data, ir_data, sampling_rate):
 #     spo2 = 104 - 17 * ratio
     spo2 = - 45.060 * ratio * ratio + 30.354 * ratio + 94.845
     
+    if spo2 < 90.0 or heart_rate == -1.0:
+        spo2 = -1.0
+        heart_rate = -1.0
     return heart_rate, spo2
+
+def insert_data(DHT20_temperature, DHT20_humidity, AGS10_TVOC, AL, BMP581_Temperature, BMP581_Pressure,
+        MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z, MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z, MPU6500_temp,
+        heart_rate, spo2, MAX30102_temp):
+    conn = sqlite3.connect('/home/xxlxxl/DockerConf/HomeAssistant/SensorDB/SensorBoard.db')
+    cursor = conn.cursor()
+    
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    cursor.execute('''
+        INSERT INTO SensorBoard (time, DHT20_temperature, DHT20_humidity, AGS10_TVOC, AL, BMP581_Temperature, BMP581_Pressure,
+        MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z, MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z, MPU6500_temp,
+        heart_rate, spo2, MAX30102_temp)
+        VALUES (?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?)
+    ''', (current_time, DHT20_temperature, DHT20_humidity, AGS10_TVOC, AL, BMP581_Temperature, BMP581_Pressure,
+        MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z, MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z, MPU6500_temp,
+        heart_rate, spo2, MAX30102_temp))
+    
+    delete_timeline = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute('''
+        DELETE FROM SensorBoard WHERE time < ?
+    ''', (delete_timeline,))
+    
+    conn.commit()
+    conn.close()
+
 
 if __name__ == '__main__':
     try:
@@ -281,10 +338,12 @@ if __name__ == '__main__':
             print("MAX30102 Init Error: ", e)
     except ValueError as e:
             print(e)
-
+#     plt.ion()
+    
     while True:
         #DHT20
         try:
+            DHT20_temperature, DHT20_humidity = -2.0, -2.0
             DHT20_temperature, DHT20_humidity = DHT20_getdata()
     #         print(
     #             "Temp: {:.2f} C    Humidity: {:.2f}% ".format(
@@ -299,6 +358,7 @@ if __name__ == '__main__':
         
         #AGS10
         try:
+            AGS10_TVOC = -2.0
             AGS10_TVOC = AGS10_getdata()
     #         print(f"TVOC: {AGS10_TVOC:.3f} ppm")
 
@@ -309,6 +369,7 @@ if __name__ == '__main__':
             
         #BH1750FVI
         try:
+            AL = -2.0
             AL = BH1750FVI_getdata()
 #             print(f"AL: {AL:.1f} lux")
             
@@ -319,7 +380,8 @@ if __name__ == '__main__':
         
         #BMP581
         try:
-            BMP581_Temperature,BMP581_Pressure = BMP581_getdata()
+            BMP581_Temperature, BMP581_Pressure = -2.0, -2.0
+            BMP581_Temperature, BMP581_Pressure = BMP581_getdata()
 #             print(
 #                 "BMP581_Temperature: {:.2f} C    BMP581_Pressure: {:.2f} Pa ".format(
 #                 BMP581_Temperature, BMP581_Pressure
@@ -333,18 +395,21 @@ if __name__ == '__main__':
         
         #MPU6500
         try:
+            MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z = -2.0, -2.0, -2.0
+            MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z = -2.0, -2.0, -2.0
+            MPU6500_temp = -2.0
             MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z, MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z, MPU6500_temp = MPU6500_getdata()
-#             print(
-#                 "Accel_X: {:.2f} g  Accel_Y: {:.2f} g  Accel_Z: {:.2f} g".format(
-#                 MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z
-#                     )
-#              )
-#             print(
-#                 "Gyro_X: {:.2f} dps  Gyro_Y: {:.2f} dps  Gyro_Z: {:.2f} dps(degrees per second)".format(
-#                 MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z
-#                     )
-#              )
-#             print(f"MPU6500_Temperature: {MPU6500_temp:.1f} C")
+            print(
+                "Accel_X: {:.2f} g  Accel_Y: {:.2f} g  Accel_Z: {:.2f} g".format(
+                MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z
+                    )
+             )
+            print(
+                "Gyro_X: {:.2f} dps  Gyro_Y: {:.2f} dps  Gyro_Z: {:.2f} dps(degrees per second)".format(
+                MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z
+                    )
+             )
+            print(f"MPU6500_Temperature: {MPU6500_temp:.1f} C")
         except OSError as e:
             print("MPU6500 I2C Communication Error: ", e)
         except ValueError as e:
@@ -352,6 +417,7 @@ if __name__ == '__main__':
         
         #MAX30102
         try:
+            heart_rate, spo2, MAX30102_temp = -2.0, -2.0, -2.0
             new_red, new_ir, MAX30102_temp = MAX30102_getdata()
             red_data = np.append(red_data, new_red)
             ir_data = np.append(ir_data, new_ir)
@@ -362,14 +428,24 @@ if __name__ == '__main__':
             sample_rate = 400 / 16 #raw sample / sample average
             
             heart_rate, spo2 = MAX30102_cal(red_data, ir_data, sample_rate)
-            print(f"Heart Rate: {heart_rate:.2f} bpm, SpO2: {spo2:.2f} %")
-            print(f"MAX30102_Temperature: {MAX30102_temp:.2f} C")
+#             print(f"Heart Rate: {heart_rate:.2f} bpm, SpO2: {spo2:.2f} %")
+#             print(f"MAX30102_Temperature: {MAX30102_temp:.2f} C")
             
         except OSError as e:
             print("MAX30102 I2C Communication Error: ", e)
         except ValueError as e:
             print(e)
         
+        #insert data to sqlite3
+        try:
+            insert_data(DHT20_temperature, DHT20_humidity, AGS10_TVOC, AL, BMP581_Temperature, BMP581_Pressure,
+        MPU6500_accel_x, MPU6500_accel_y, MPU6500_accel_z, MPU6500_gyro_x, MPU6500_gyro_y, MPU6500_gyro_z, MPU6500_temp,
+        heart_rate, spo2, MAX30102_temp)
+#             print(f"AL: {AL:.1f} lux")
+            
+        except OSError as e:
+            print("Sqlite3 Error: ", e)
+            
 #         if keyboard.is_pressed('q'):
 #             print("Q key pressed. Exiting...")
 #             break
